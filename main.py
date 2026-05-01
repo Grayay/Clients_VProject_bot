@@ -38,10 +38,10 @@ async def main() -> None:
 
     bot = Bot(token=config.bot_token)
     dispatcher = Dispatcher()
-    dispatcher.include_router(build_router(database))
 
     google_sheets_client = GoogleSheetsClient(config)
     notification_service = NotificationService(bot, config, database)
+    dispatcher.include_router(build_router(database, notification_service))
     lead_service = LeadService(database, google_sheets_client, notification_service)
     polling_task = asyncio.create_task(
         leads_polling_loop(lead_service, config.leads_poll_interval_seconds)

@@ -16,6 +16,18 @@ def normalize_brand(value: str | None) -> str:
     return " ".join(tokens)
 
 
+def find_exact_brand_rule(brand_name: str, rules: list[dict[str, Any]]) -> dict[str, Any] | None:
+    normalized_brand = normalize_brand(brand_name)
+    if not normalized_brand:
+        return None
+
+    for rule in rules:
+        if rule.get("is_active") and normalize_brand(rule.get("brand_pattern")) == normalized_brand:
+            return rule
+
+    return None
+
+
 def _find_booker_in_rules(brand_name: str, rules: list[dict[str, Any]]) -> dict[str, Any] | None:
     normalized_brand = normalize_brand(brand_name)
     if not normalized_brand:
