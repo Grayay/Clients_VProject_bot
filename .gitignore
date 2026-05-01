@@ -1,0 +1,12 @@
+.env
+google_service_account.json
+leads.db
+*.db
+*.db-shm
+*.db-wal
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.idea/
+.vscode/
