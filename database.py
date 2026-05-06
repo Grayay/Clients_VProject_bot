@@ -131,6 +131,17 @@ class Database:
                     assigned_at TEXT NOT NULL
                 )
             """)
+            connection.execute("""
+                CREATE TABLE IF NOT EXISTS lead_personal_notifications (
+                    lead_id INTEGER NOT NULL,
+                    booker_telegram_id INTEGER NOT NULL,
+                    message_id INTEGER NULL,
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    last_error TEXT NULL,
+                    updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY (lead_id, booker_telegram_id)
+                )
+            """)
             self._ensure_columns(
                 connection,
                 "lead_assignments",
@@ -140,6 +151,18 @@ class Database:
                     "booker_username": "booker_username TEXT",
                     "booker_name": "booker_name TEXT",
                     "assigned_at": "assigned_at TEXT",
+                },
+            )
+            self._ensure_columns(
+                connection,
+                "lead_personal_notifications",
+                {
+                    "lead_id": "lead_id INTEGER NOT NULL DEFAULT 0",
+                    "booker_telegram_id": "booker_telegram_id INTEGER NOT NULL DEFAULT 0",
+                    "message_id": "message_id INTEGER NULL",
+                    "status": "status TEXT NOT NULL DEFAULT 'pending'",
+                    "last_error": "last_error TEXT NULL",
+                    "updated_at": "updated_at TEXT DEFAULT CURRENT_TIMESTAMP",
                 },
             )
             connection.execute("""
@@ -161,6 +184,10 @@ class Database:
             connection.execute("""
                 CREATE UNIQUE INDEX IF NOT EXISTS idx_lead_assignments_lead_id
                 ON lead_assignments(lead_id)
+            """)
+            connection.execute("""
+                CREATE INDEX IF NOT EXISTS idx_lead_personal_notifications_status
+                ON lead_personal_notifications(status)
             """)
             connection.execute("""
                 UPDATE form_leads
@@ -297,11 +324,6 @@ class Database:
         assigned_booker_name: str | None = None,
         last_error: str | None = None,
     ) -> None:
-        if assigned_booker_id is None:
-            assigned_booker_id = responsible_booker_telegram_id
-        if assigned_booker_name is None:
-            assigned_booker_name = responsible_booker_name
-
         with self.connect() as connection:
             connection.execute(
                 """
@@ -313,8 +335,8 @@ class Database:
                     routing_status = ?,
                     common_notification_status = COALESCE(?, common_notification_status),
                     personal_notification_status = COALESCE(?, personal_notification_status),
-                    assigned_booker_id = ?,
-                    assigned_booker_name = ?,
+                    assigned_booker_id = COALESCE(?, assigned_booker_id),
+                    assigned_booker_name = COALESCE(?, assigned_booker_name),
                     last_error = ?,
                     updated_at = CURRENT_TIMESTAMP
                 WHERE id = ?
@@ -345,8 +367,7 @@ class Database:
                     AND COALESCE(common_notification_status, 'pending') IN ('pending', 'failed')
                 )
                 OR (
-                    personal_message_id IS NULL
-                    AND COALESCE(personal_notification_status, 'not_needed') IN ('pending', 'failed')
+                    COALESCE(personal_notification_status, 'not_needed') IN ('pending', 'failed')
                 )
                 ORDER BY created_at ASC, id ASC
                 LIMIT ?
@@ -364,29 +385,22 @@ class Database:
     ) -> tuple[bool, dict[str, Any] | None]:
         with self.connect() as connection:
             lead = connection.execute(
-                """
-                SELECT
-                    id,
-                    responsible_booker_telegram_id,
-                    responsible_booker_name,
-                    assigned_booker_id,
-                    assigned_booker_name
-                FROM form_leads
-                WHERE id = ?
-                """,
+                "SELECT id FROM form_leads WHERE id = ?",
                 (lead_id,),
             ).fetchone()
             if lead is None:
                 return False, None
 
-            existing_booker_id = lead["assigned_booker_id"] or lead["responsible_booker_telegram_id"]
-            if existing_booker_id:
-                return False, {
-                    "lead_id": lead_id,
-                    "booker_telegram_id": existing_booker_id,
-                    "booker_username": None,
-                    "booker_name": lead["assigned_booker_name"] or lead["responsible_booker_name"],
-                }
+            existing_assignment = connection.execute(
+                """
+                SELECT *
+                FROM lead_assignments
+                WHERE lead_id = ?
+                """,
+                (lead_id,),
+            ).fetchone()
+            if existing_assignment is not None:
+                return False, self._to_dict(existing_assignment)
 
             cursor = connection.execute(
                 """
@@ -434,6 +448,18 @@ class Database:
 
             return assigned, self._to_dict(assignment)
 
+    def get_lead_assignment(self, lead_id: int) -> dict[str, Any] | None:
+        with self.connect() as connection:
+            row = connection.execute(
+                """
+                SELECT *
+                FROM lead_assignments
+                WHERE lead_id = ?
+                """,
+                (lead_id,),
+            ).fetchone()
+        return self._to_dict(row)
+
     def take_lead(self, lead_id: int, user_id: int, user_label: str | None = None) -> bool:
         assigned, _ = self.assign_lead(lead_id, user_id, None, user_label)
         return assigned
@@ -457,6 +483,59 @@ class Database:
         booker_telegram_id: int,
         booker_name: str | None = None,
     ) -> int:
+        return self.ensure_brand_rule(brand_pattern, booker_telegram_id, booker_name)
+
+    def find_brand_rule_for_booker(
+        self,
+        brand_pattern: str,
+        booker_telegram_id: int,
+        *,
+        only_active: bool = True,
+    ) -> dict[str, Any] | None:
+        sql = """
+            SELECT *
+            FROM brand_booker_rules
+            WHERE lower(trim(brand_pattern)) = lower(trim(?))
+              AND booker_telegram_id = ?
+        """
+        params: tuple[Any, ...] = (brand_pattern.strip(), booker_telegram_id)
+        if only_active:
+            sql += " AND is_active = 1"
+        sql += " ORDER BY is_active DESC, id ASC LIMIT 1"
+
+        with self.connect() as connection:
+            row = connection.execute(sql, params).fetchone()
+        return self._to_dict(row)
+
+    def ensure_brand_rule(
+        self,
+        brand_pattern: str,
+        booker_telegram_id: int,
+        booker_name: str | None = None,
+    ) -> int:
+        brand_pattern = brand_pattern.strip()
+        existing_active = self.find_brand_rule_for_booker(
+            brand_pattern,
+            booker_telegram_id,
+            only_active=True,
+        )
+        if existing_active:
+            return int(existing_active["id"])
+
+        existing_any = self.find_brand_rule_for_booker(
+            brand_pattern,
+            booker_telegram_id,
+            only_active=False,
+        )
+        if existing_any:
+            self.update_brand_rule(
+                int(existing_any["id"]),
+                brand_pattern,
+                booker_telegram_id,
+                booker_name,
+            )
+            return int(existing_any["id"])
+
         with self.connect() as connection:
             cursor = connection.execute(
                 """
@@ -467,9 +546,56 @@ class Database:
                 )
                 VALUES (?, ?, ?)
                 """,
-                (brand_pattern.strip(), booker_telegram_id, booker_name),
+                (brand_pattern, booker_telegram_id, booker_name),
             )
             return int(cursor.lastrowid)
+
+    def get_lead_personal_notification(
+        self,
+        lead_id: int,
+        booker_telegram_id: int,
+    ) -> dict[str, Any] | None:
+        with self.connect() as connection:
+            row = connection.execute(
+                """
+                SELECT *
+                FROM lead_personal_notifications
+                WHERE lead_id = ?
+                  AND booker_telegram_id = ?
+                """,
+                (lead_id, booker_telegram_id),
+            ).fetchone()
+        return self._to_dict(row)
+
+    def upsert_lead_personal_notification(
+        self,
+        lead_id: int,
+        booker_telegram_id: int,
+        *,
+        message_id: int | None,
+        status: str,
+        last_error: str | None = None,
+    ) -> None:
+        with self.connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO lead_personal_notifications (
+                    lead_id,
+                    booker_telegram_id,
+                    message_id,
+                    status,
+                    last_error,
+                    updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                ON CONFLICT(lead_id, booker_telegram_id) DO UPDATE SET
+                    message_id = COALESCE(excluded.message_id, lead_personal_notifications.message_id),
+                    status = excluded.status,
+                    last_error = excluded.last_error,
+                    updated_at = CURRENT_TIMESTAMP
+                """,
+                (lead_id, booker_telegram_id, message_id, status, last_error),
+            )
 
     def update_brand_rule(
         self,

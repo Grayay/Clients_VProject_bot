@@ -1,6 +1,6 @@
 import logging
 
-from brand_router import find_booker_for_brand
+from brand_router import find_bookers_for_brand
 from database import Database
 from google_sheets_client import GoogleSheetsClient
 from notifications import NotificationService
@@ -21,18 +21,20 @@ class LeadService:
         self.notification_service = notification_service
 
     @staticmethod
-    def _stored_booker_for_lead(lead: dict) -> dict | None:
+    def _stored_booker_for_lead(lead: dict) -> list[dict]:
         booker_id = lead.get("assigned_booker_id") or lead.get("responsible_booker_telegram_id")
         if not booker_id:
-            return None
+            return []
 
-        return {
-            "booker_telegram_id": int(booker_id),
-            "booker_name": lead.get("assigned_booker_name") or lead.get("responsible_booker_name"),
-        }
+        return [
+            {
+                "booker_telegram_id": int(booker_id),
+                "booker_name": lead.get("assigned_booker_name") or lead.get("responsible_booker_name"),
+            }
+        ]
 
-    def _booker_for_lead(self, lead: dict) -> dict | None:
-        return find_booker_for_brand(lead.get("brand_name") or "") or self._stored_booker_for_lead(lead)
+    def _bookers_for_lead(self, lead: dict) -> list[dict]:
+        return find_bookers_for_brand(lead.get("brand_name") or "") or self._stored_booker_for_lead(lead)
 
     async def poll_once(self) -> None:
         sheet_leads = self.google_sheets_client.fetch_leads()
@@ -51,8 +53,8 @@ class LeadService:
                 LOGGER.error("Inserted lead cannot be loaded: lead_id=%s", lead_id)
                 continue
 
-            booker = self._booker_for_lead(lead)
-            await self.notification_service.send_lead_notifications(lead, booker)
+            bookers = self._bookers_for_lead(lead)
+            await self.notification_service.send_lead_notifications(lead, bookers)
 
         await self.retry_pending_notifications(exclude_lead_ids=processed_lead_ids)
 
@@ -69,8 +71,8 @@ class LeadService:
             if lead_id in exclude_lead_ids:
                 continue
 
-            booker = self._booker_for_lead(lead)
-            await self.notification_service.send_lead_notifications(lead, booker)
+            bookers = self._bookers_for_lead(lead)
+            await self.notification_service.send_lead_notifications(lead, bookers)
             retried_count += 1
 
         if retried_count:

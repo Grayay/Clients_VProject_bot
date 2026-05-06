@@ -28,10 +28,34 @@ def find_exact_brand_rule(brand_name: str, rules: list[dict[str, Any]]) -> dict[
     return None
 
 
-def _find_booker_in_rules(brand_name: str, rules: list[dict[str, Any]]) -> dict[str, Any] | None:
+def find_exact_brand_rules(brand_name: str, rules: list[dict[str, Any]]) -> list[dict[str, Any]]:
     normalized_brand = normalize_brand(brand_name)
     if not normalized_brand:
-        return None
+        return []
+
+    return [
+        rule
+        for rule in rules
+        if rule.get("is_active") and normalize_brand(rule.get("brand_pattern")) == normalized_brand
+    ]
+
+
+def _dedupe_rules_by_booker(rules: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    result = []
+    seen_booker_ids = set()
+    for rule in rules:
+        booker_id = rule.get("booker_telegram_id")
+        if booker_id in seen_booker_ids:
+            continue
+        seen_booker_ids.add(booker_id)
+        result.append(rule)
+    return result
+
+
+def _find_bookers_in_rules(brand_name: str, rules: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    normalized_brand = normalize_brand(brand_name)
+    if not normalized_brand:
+        return []
 
     normalized_rules = [
         (rule, normalize_brand(rule.get("brand_pattern")))
@@ -40,15 +64,29 @@ def _find_booker_in_rules(brand_name: str, rules: list[dict[str, Any]]) -> dict[
     ]
     normalized_rules = [(rule, pattern) for rule, pattern in normalized_rules if pattern]
 
-    for rule, pattern in normalized_rules:
-        if normalized_brand == pattern:
-            return rule
+    exact_matches = [
+        rule
+        for rule, pattern in normalized_rules
+        if normalized_brand == pattern
+    ]
+    if exact_matches:
+        return _dedupe_rules_by_booker(exact_matches)
 
-    for rule, pattern in normalized_rules:
-        if normalized_brand in pattern or pattern in normalized_brand:
-            return rule
+    partial_matches = [
+        rule
+        for rule, pattern in normalized_rules
+        if normalized_brand in pattern or pattern in normalized_brand
+    ]
+    return _dedupe_rules_by_booker(partial_matches)
 
-    return None
+
+def _find_booker_in_rules(brand_name: str, rules: list[dict[str, Any]]) -> dict[str, Any] | None:
+    bookers = _find_bookers_in_rules(brand_name, rules)
+    return bookers[0] if bookers else None
+
+
+def find_bookers_in_rules(brand_name: str, rules: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return _find_bookers_in_rules(brand_name, rules)
 
 
 def find_booker_for_brand(brand_name: str) -> dict[str, Any] | None:
@@ -56,3 +94,10 @@ def find_booker_for_brand(brand_name: str) -> dict[str, Any] | None:
     database = Database(config.database_path)
     database.init()
     return _find_booker_in_rules(brand_name, database.list_active_brand_rules())
+
+
+def find_bookers_for_brand(brand_name: str) -> list[dict[str, Any]]:
+    config = load_config()
+    database = Database(config.database_path)
+    database.init()
+    return _find_bookers_in_rules(brand_name, database.list_active_brand_rules())

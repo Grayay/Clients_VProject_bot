@@ -37,29 +37,13 @@ class NotificationService:
         self.database = database
 
     @staticmethod
-    def _lead_keyboard(lead_id: int, *, can_take: bool) -> InlineKeyboardMarkup:
-        action_row = []
-        if can_take:
-            action_row.append(
-                InlineKeyboardButton(
-                    text="Взять в работу",
-                    callback_data=f"lead_take:{lead_id}",
-                )
-            )
-        action_row.append(
-            InlineKeyboardButton(
-                text="Закрыть",
-                callback_data=f"lead_close:{lead_id}",
-            )
-        )
-
+    def _lead_keyboard(lead_id: int) -> InlineKeyboardMarkup:
         return InlineKeyboardMarkup(
             inline_keyboard=[
-                action_row,
                 [
                     InlineKeyboardButton(
-                        text="📋 Закрепления брендов",
-                        callback_data="show_brand_rules",
+                        text="Взять в работу",
+                        callback_data=f"lead_take:{lead_id}",
                     ),
                 ],
             ]
@@ -100,22 +84,32 @@ class NotificationService:
         username = NotificationService._extract_username(booker_name)
         clean_name = NotificationService._clean_booker_name(booker_name, username, booker_id_text)
 
-        if clean_name and username:
-            return f"{clean_name} ({username})"
-        if clean_name:
-            return f"{clean_name} ({booker_id_text})"
         if username:
             return username
+        if clean_name:
+            return clean_name
         return booker_id_text
 
     @staticmethod
-    def _booker_label(booker: dict[str, Any] | None) -> str:
-        if not booker:
+    def _as_booker_list(bookers: dict[str, Any] | list[dict[str, Any]] | None) -> list[dict[str, Any]]:
+        if bookers is None:
+            return []
+        if isinstance(bookers, dict):
+            return [bookers]
+        return [booker for booker in bookers if booker]
+
+    @staticmethod
+    def _booker_label(bookers: dict[str, Any] | list[dict[str, Any]] | None) -> str:
+        booker_list = NotificationService._as_booker_list(bookers)
+        if not booker_list:
             return "не найден"
 
-        return NotificationService.format_booker_label(
-            booker["booker_telegram_id"],
-            booker.get("booker_name"),
+        return ", ".join(
+            NotificationService.format_booker_label(
+                booker["booker_telegram_id"],
+                booker.get("booker_name"),
+            )
+            for booker in booker_list
         )
 
     @staticmethod
@@ -183,12 +177,16 @@ class NotificationService:
         text = f"{type(error).__name__}: {error}".strip()
         return (text or type(error).__name__)[:1000]
 
-    def _common_message_text(self, lead: dict[str, Any], booker: dict[str, Any] | None) -> str:
+    def _common_message_text(
+        self,
+        lead: dict[str, Any],
+        bookers: dict[str, Any] | list[dict[str, Any]] | None,
+    ) -> str:
         lines = [
             "🆕 Новая заявка от клиента",
             "",
             f"Бренд: {self._value(lead.get('brand_name'))}",
-            f"Ответственный букер: {self._booker_label(booker)}",
+            f"Ответственный букер: {self._booker_label(bookers)}",
             "",
             "Данные заявки:",
             *self._payload_lines(lead),
@@ -248,7 +246,7 @@ class NotificationService:
         reply_markup: InlineKeyboardMarkup | None = None,
     ) -> int | None:
         if reply_markup is None:
-            reply_markup = self._lead_keyboard(int(lead["id"]), can_take=True)
+            reply_markup = self._lead_keyboard(int(lead["id"]))
 
         message_id, _ = await self._send_personal_message(
             lead,
@@ -275,8 +273,13 @@ class NotificationService:
                 exc_info=True,
             )
 
-    async def send_lead_notifications(self, lead: dict[str, Any], booker: dict[str, Any] | None) -> None:
+    async def send_lead_notifications(
+        self,
+        lead: dict[str, Any],
+        bookers: dict[str, Any] | list[dict[str, Any]] | None,
+    ) -> None:
         lead_id = int(lead["id"])
+        booker_list = self._as_booker_list(bookers)
         common_message_id = lead.get("common_chat_message_id")
         personal_message_id = lead.get("personal_message_id")
         common_status = str(lead.get("common_notification_status") or "pending")
@@ -289,8 +292,8 @@ class NotificationService:
             try:
                 common_message = await self.bot.send_message(
                     chat_id=self.config.leads_notify_chat_id,
-                    text=self._common_message_text(lead, booker),
-                    reply_markup=self._lead_keyboard(lead_id, can_take=booker is None),
+                    text=self._common_message_text(lead, booker_list),
+                    reply_markup=self._lead_keyboard(lead_id),
                 )
                 common_message_id = common_message.message_id
                 common_status = "sent"
@@ -306,28 +309,57 @@ class NotificationService:
 
         responsible_id = None
         responsible_name = None
-        if booker:
-            responsible_id = int(booker["booker_telegram_id"])
-            responsible_name = booker.get("booker_name")
-            if personal_message_id or personal_status == "sent":
-                personal_status = "sent"
-            else:
-                personal_status = "pending"
-                personal_message_id, personal_error = await self._send_personal_message(
+        first_personal_message_id = personal_message_id
+        personal_failures = 0
+        personal_sent = 0
+
+        if booker_list:
+            first_booker = booker_list[0]
+            responsible_id = int(first_booker["booker_telegram_id"])
+            responsible_name = first_booker.get("booker_name")
+
+            for booker in booker_list:
+                booker_id = int(booker["booker_telegram_id"])
+                existing_delivery = self.database.get_lead_personal_notification(lead_id, booker_id)
+                if existing_delivery and (
+                    existing_delivery.get("message_id") or existing_delivery.get("status") == "sent"
+                ):
+                    personal_sent += 1
+                    if first_personal_message_id is None and existing_delivery.get("message_id"):
+                        first_personal_message_id = existing_delivery.get("message_id")
+                    continue
+
+                message_id, personal_error = await self._send_personal_message(
                     lead,
-                    responsible_id,
-                    reply_markup=self._lead_keyboard(lead_id, can_take=True),
+                    booker_id,
+                    reply_markup=self._lead_keyboard(lead_id),
                 )
-                if personal_message_id is None:
-                    personal_status = "failed"
+                if message_id is None:
+                    personal_failures += 1
+                    self.database.upsert_lead_personal_notification(
+                        lead_id,
+                        booker_id,
+                        message_id=None,
+                        status="failed",
+                        last_error=personal_error,
+                    )
                     if personal_error:
-                        last_errors.append(f"personal: {personal_error}")
+                        last_errors.append(f"personal {booker_id}: {personal_error}")
                 else:
-                    personal_status = "sent"
+                    personal_sent += 1
+                    first_personal_message_id = first_personal_message_id or message_id
+                    self.database.upsert_lead_personal_notification(
+                        lead_id,
+                        booker_id,
+                        message_id=message_id,
+                        status="sent",
+                    )
+
+            personal_status = "pending" if personal_sent and personal_failures else "failed" if personal_failures else "sent"
         else:
             personal_status = "not_needed"
 
-        routing_status = "matched" if booker else "not_matched"
+        routing_status = "matched" if booker_list else "not_matched"
         if lead.get("routing_status") == "assigned":
             routing_status = "assigned"
 
@@ -336,11 +368,9 @@ class NotificationService:
             responsible_booker_telegram_id=responsible_id,
             responsible_booker_name=responsible_name,
             common_chat_message_id=int(common_message_id) if common_message_id else None,
-            personal_message_id=int(personal_message_id) if personal_message_id else None,
+            personal_message_id=int(first_personal_message_id) if first_personal_message_id else None,
             routing_status=routing_status,
             common_notification_status=common_status,
             personal_notification_status=personal_status,
-            assigned_booker_id=responsible_id,
-            assigned_booker_name=responsible_name,
             last_error="; ".join(last_errors) if last_errors else None,
         )

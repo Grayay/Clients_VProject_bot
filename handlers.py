@@ -2,15 +2,24 @@ import logging
 
 from aiogram import F, Router
 from aiogram.filters import Command, CommandObject, CommandStart
-from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
+from aiogram.types import (
+    CallbackQuery,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    KeyboardButton,
+    Message,
+    ReplyKeyboardMarkup,
+)
 
-from brand_router import find_booker_for_brand, find_exact_brand_rule, normalize_brand
+from brand_router import find_booker_for_brand, find_bookers_in_rules, normalize_brand
 from database import Database
 from notifications import NotificationService
 
 
 LOGGER = logging.getLogger(__name__)
 
+
+RESPONSIBILITY_BUTTON_TEXT = "📋 Посмотреть ответственность"
 
 ADD_BRAND_RULE_HELP = (
     "Чтобы закрепить бренд за букером, отправьте команду:\n\n"
@@ -27,25 +36,27 @@ TEST_BRAND_ROUTE_HELP = (
 )
 
 
-def _start_keyboard() -> InlineKeyboardMarkup:
+def _start_keyboard() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text=RESPONSIBILITY_BUTTON_TEXT)],
+        ],
+        resize_keyboard=True,
+        input_field_placeholder="Выберите действие",
+    )
+
+
+def _take_confirmation_keyboard(lead_id: int, user_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
                 InlineKeyboardButton(
-                    text="📋 Закрепления брендов",
-                    callback_data="show_brand_rules",
+                    text="Всё равно взять",
+                    callback_data=f"lead_take_force:{lead_id}:{user_id}",
                 ),
-            ],
-            [
                 InlineKeyboardButton(
-                    text="➕ Как добавить бренд",
-                    callback_data="show_add_brand_rule_help",
-                ),
-            ],
-            [
-                InlineKeyboardButton(
-                    text="🔍 Как проверить бренд",
-                    callback_data="show_test_brand_route_help",
+                    text="Не брать",
+                    callback_data=f"lead_take_cancel:{lead_id}:{user_id}",
                 ),
             ],
         ]
@@ -96,9 +107,9 @@ def _brand_rule_display(rule: dict) -> str:
 def _brand_rules_text(database: Database) -> str:
     rules = database.list_active_brand_rules()
     if not rules:
-        return "Пока нет активных закреплений брендов."
+        return "Пока нет ответственных брендов."
 
-    lines = ["📋 Закрепления брендов", ""]
+    lines = ["📋 Ответственность по брендам", ""]
     lines.extend(_booker_line(rule) for rule in rules)
     return "\n".join(lines)
 
@@ -123,6 +134,39 @@ def _parse_lead_id(data: str | None) -> int | None:
         return None
 
 
+def _parse_lead_user_ids(data: str | None) -> tuple[int, int] | None:
+    if not data:
+        return None
+    parts = data.split(":")
+    if len(parts) != 3:
+        return None
+    try:
+        return int(parts[1]), int(parts[2])
+    except ValueError:
+        return None
+
+
+def _brand_responsibility_rules(database: Database, brand_name: str | None) -> list[dict]:
+    normalized_brand = normalize_brand(brand_name)
+    if not normalized_brand:
+        return []
+    return find_bookers_in_rules(normalized_brand, database.list_active_brand_rules())
+
+
+def _user_is_responsible_for_brand(rules: list[dict], user_id: int) -> bool:
+    return any(int(rule["booker_telegram_id"]) == user_id for rule in rules)
+
+
+def _responsibility_labels(rules: list[dict]) -> list[str]:
+    return [
+        NotificationService.format_booker_label(
+            rule["booker_telegram_id"],
+            rule.get("booker_name"),
+        )
+        for rule in rules
+    ]
+
+
 def _save_brand_assignment(
     database: Database,
     brand_name: str | None,
@@ -133,12 +177,7 @@ def _save_brand_assignment(
     if not normalized_brand:
         return None
 
-    exact_rule = find_exact_brand_rule(normalized_brand, database.list_active_brand_rules())
-    if exact_rule:
-        rule_id = int(exact_rule["id"])
-        database.update_brand_rule(rule_id, normalized_brand, booker_telegram_id, booker_label)
-    else:
-        rule_id = database.add_brand_rule(normalized_brand, booker_telegram_id, booker_label)
+    rule_id = database.ensure_brand_rule(normalized_brand, booker_telegram_id, booker_label)
 
     LOGGER.info(
         "Brand assigned to booker: brand=%r normalized_brand=%r booker_id=%s rule_id=%s",
@@ -153,16 +192,67 @@ def _save_brand_assignment(
 def build_router(database: Database, notification_service: NotificationService) -> Router:
     router = Router()
 
+    async def assign_lead_to_user(callback: CallbackQuery, lead_id: int) -> tuple[bool, str | None]:
+        user = callback.from_user
+        username = user.username
+        full_name = user.full_name
+        label = _booker_display(user.id, username, full_name)
+
+        assigned, assignment = database.assign_lead(lead_id, user.id, username, full_name)
+
+        if assignment is None:
+            await callback.answer("Заявка не найдена.", show_alert=True)
+            return False, None
+
+        if not assigned:
+            assigned_to = _assignment_label(assignment)
+            existing_booker_id = int(assignment["booker_telegram_id"])
+            answer = (
+                "Заявка уже закреплена за вами"
+                if existing_booker_id == user.id
+                else "Заявка уже закреплена за букером"
+            )
+            if assigned_to:
+                answer = f"{answer}: {assigned_to}"
+            await callback.answer(answer, show_alert=True)
+            return False, None
+
+        LOGGER.info("Lead assigned: lead_id=%s booker_id=%s booker=%s", lead_id, user.id, label)
+
+        lead = database.get_lead(lead_id)
+        if lead is not None:
+            _save_brand_assignment(database, lead.get("brand_name"), user.id, label)
+            database.update_lead_routing(
+                lead_id,
+                responsible_booker_telegram_id=user.id,
+                responsible_booker_name=label,
+                common_chat_message_id=lead.get("common_chat_message_id"),
+                personal_message_id=lead.get("personal_message_id"),
+                routing_status="assigned",
+                common_notification_status=lead.get("common_notification_status"),
+                personal_notification_status=lead.get("personal_notification_status"),
+                assigned_booker_id=user.id,
+                assigned_booker_name=label,
+                last_error=None,
+            )
+
+        await callback.answer("Заявка взята в работу.")
+        await notification_service.announce_lead_assignment(
+            lead or {"id": lead_id, "common_chat_message_id": None},
+            NotificationService.format_booker_label(user.id, label),
+        )
+        return True, label
+
     @router.message(CommandStart())
     async def start(message: Message) -> None:
         await message.answer(
-            "Бот заявок клиентов\n\n"
-            "Что можно сделать:\n"
-            "• посмотреть закрепления брендов;\n"
-            "• добавить бренд к букеру;\n"
-            "• проверить, к кому относится бренд.",
+            "Бот заявок клиентов",
             reply_markup=_start_keyboard(),
         )
+
+    @router.message(F.text == RESPONSIBILITY_BUTTON_TEXT)
+    async def responsibility_button(message: Message) -> None:
+        await message.answer(_brand_rules_text(database))
 
     @router.message(Command("brand_rules"))
     async def brand_rules(message: Message) -> None:
@@ -229,54 +319,68 @@ def build_router(database: Database, notification_service: NotificationService) 
             return
 
         user = callback.from_user
-        username = user.username
-        full_name = user.full_name
-        label = _booker_display(user.id, username, full_name)
-
-        assigned, assignment = database.assign_lead(lead_id, user.id, username, full_name)
-
-        if assignment is None:
+        lead = database.get_lead(lead_id)
+        if lead is None:
             await callback.answer("Заявка не найдена.", show_alert=True)
             return
 
-        if not assigned:
-            assigned_to = _assignment_label(assignment)
-            existing_booker_id = int(assignment["booker_telegram_id"])
-            answer = (
-                "Заявка уже закреплена за вами"
-                if existing_booker_id == user.id
-                else "Заявка уже закреплена за букером"
-            )
+        existing_assignment = database.get_lead_assignment(lead_id)
+        if existing_assignment is not None:
+            assigned_to = _assignment_label(existing_assignment)
+            answer = "Заявка уже взята"
             if assigned_to:
                 answer = f"{answer}: {assigned_to}"
             await callback.answer(answer, show_alert=True)
             return
 
-        LOGGER.info("Lead assigned: lead_id=%s booker_id=%s booker=%s", lead_id, user.id, label)
+        responsibility_rules = _brand_responsibility_rules(database, lead.get("brand_name"))
+        if responsibility_rules and not _user_is_responsible_for_brand(responsibility_rules, user.id):
+            labels = "\n".join(_responsibility_labels(responsibility_rules))
+            await callback.answer()
+            if callback.message:
+                await callback.message.answer(
+                    "Этот бренд уже закреплён за:\n"
+                    f"{labels}\n\n"
+                    "Всё равно взять в работу?",
+                    reply_markup=_take_confirmation_keyboard(lead_id, user.id),
+                )
+            return
 
-        lead = database.get_lead(lead_id)
-        if lead is not None:
-            _save_brand_assignment(database, lead.get("brand_name"), user.id, label)
-            personal_message_id = await notification_service.send_personal_lead(lead, user.id)
-            database.update_lead_routing(
-                lead_id,
-                responsible_booker_telegram_id=user.id,
-                responsible_booker_name=label,
-                common_chat_message_id=lead.get("common_chat_message_id"),
-                personal_message_id=personal_message_id,
-                routing_status="assigned",
-                common_notification_status=lead.get("common_notification_status"),
-                personal_notification_status="sent" if personal_message_id is not None else "failed",
-                assigned_booker_id=user.id,
-                assigned_booker_name=label,
-                last_error=None if personal_message_id is not None else "personal notification failed after assignment",
+        await assign_lead_to_user(callback, lead_id)
+
+    @router.callback_query(F.data.startswith("lead_take_force:"))
+    async def lead_take_force(callback: CallbackQuery) -> None:
+        parsed = _parse_lead_user_ids(callback.data)
+        if parsed is None:
+            await callback.answer("Некорректная заявка.", show_alert=True)
+            return
+
+        lead_id, expected_user_id = parsed
+        if callback.from_user.id != expected_user_id:
+            await callback.answer("Это подтверждение не для вас.", show_alert=True)
+            return
+
+        assigned, label = await assign_lead_to_user(callback, lead_id)
+        if assigned and callback.message:
+            await callback.message.edit_text(
+                f"Заявка взята в работу: {NotificationService.format_booker_label(expected_user_id, label)}"
             )
 
-        await callback.answer("Заявка взята в работу.")
-        await notification_service.announce_lead_assignment(
-            lead or {"id": lead_id, "common_chat_message_id": None},
-            label,
-        )
+    @router.callback_query(F.data.startswith("lead_take_cancel:"))
+    async def lead_take_cancel(callback: CallbackQuery) -> None:
+        parsed = _parse_lead_user_ids(callback.data)
+        if parsed is None:
+            await callback.answer("Некорректная заявка.", show_alert=True)
+            return
+
+        _, expected_user_id = parsed
+        if callback.from_user.id != expected_user_id:
+            await callback.answer("Это подтверждение не для вас.", show_alert=True)
+            return
+
+        await callback.answer("Ок, не берём заявку.")
+        if callback.message:
+            await callback.message.edit_text("Заявка не взята.")
 
     @router.callback_query(F.data.startswith("lead_close:"))
     async def lead_close(callback: CallbackQuery) -> None:
