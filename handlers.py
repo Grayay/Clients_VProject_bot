@@ -177,6 +177,10 @@ def _responsible_history_text(database: Database, period: str) -> str:
     is_month = period == "month"
     rows = database.list_responsible_history(days=30 if is_month else None)
     if not rows:
+        LOGGER.info(
+            "Responsible history built: period=%s rows=0 bookers=0",
+            period,
+        )
         return (
             "За последний месяц пока нет ответственных по заявкам."
             if is_month
@@ -193,13 +197,20 @@ def _responsible_history_text(database: Database, period: str) -> str:
             }
         grouped[booker_id]["leads"].append(row)
 
+    LOGGER.info(
+        "Responsible history built: period=%s rows=%s bookers=%s",
+        period,
+        len(rows),
+        len(grouped),
+    )
+
     sorted_groups = sorted(
         grouped.values(),
         key=lambda group: (-len(group["leads"]), group["label"].lower()),
     )
 
     title = "📋 Ответственные за последний месяц" if is_month else "📋 Ответственные за всё время"
-    lines = [title, "", f"Всего заявок в работе: {len(rows)}"]
+    lines = [title]
 
     for group in sorted_groups:
         leads = sorted(
@@ -365,6 +376,24 @@ def build_router(database: Database, notification_service: NotificationService) 
     @router.message(Command("brand_rules"))
     async def brand_rules(message: Message) -> None:
         await message.answer(_brand_rules_text(database))
+
+    @router.message(Command("debug_leads_count"))
+    async def debug_leads_count(message: Message) -> None:
+        counts = database.get_leads_debug_counts()
+        await message.answer(
+            "\n".join(
+                [
+                    "Диагностика заявок",
+                    "",
+                    f"Всего лидов: {counts['total_leads']}",
+                    f"assigned_booker_telegram_id: {counts['assigned_booker_telegram_id']}",
+                    f"status=in_progress: {counts['in_progress']}",
+                    f"taken_at заполнен: {counts['taken_at']}",
+                    f"В истории за всё время: {counts['history_all']}",
+                    f"В истории за 30 дней: {counts['history_month']}",
+                ]
+            )
+        )
 
     @router.message(Command("add_brand_rule"))
     async def add_brand_rule(message: Message, command: CommandObject) -> None:

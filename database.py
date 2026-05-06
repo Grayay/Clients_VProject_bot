@@ -197,6 +197,84 @@ class Database:
             """)
             connection.execute("""
                 UPDATE form_leads
+                SET status = CASE
+                        WHEN COALESCE(status, '') IN ('', 'new') THEN 'in_progress'
+                        ELSE status
+                    END,
+                    responsible_booker_telegram_id = COALESCE(
+                        responsible_booker_telegram_id,
+                        (
+                            SELECT booker_telegram_id
+                            FROM lead_assignments
+                            WHERE lead_assignments.lead_id = form_leads.id
+                            LIMIT 1
+                        )
+                    ),
+                    responsible_booker_name = COALESCE(
+                        NULLIF(responsible_booker_name, ''),
+                        (
+                            SELECT booker_name
+                            FROM lead_assignments
+                            WHERE lead_assignments.lead_id = form_leads.id
+                            LIMIT 1
+                        )
+                    ),
+                    assigned_booker_id = COALESCE(
+                        assigned_booker_id,
+                        (
+                            SELECT booker_telegram_id
+                            FROM lead_assignments
+                            WHERE lead_assignments.lead_id = form_leads.id
+                            LIMIT 1
+                        )
+                    ),
+                    assigned_booker_telegram_id = COALESCE(
+                        assigned_booker_telegram_id,
+                        (
+                            SELECT booker_telegram_id
+                            FROM lead_assignments
+                            WHERE lead_assignments.lead_id = form_leads.id
+                            LIMIT 1
+                        )
+                    ),
+                    assigned_booker_username = COALESCE(
+                        NULLIF(assigned_booker_username, ''),
+                        (
+                            SELECT booker_username
+                            FROM lead_assignments
+                            WHERE lead_assignments.lead_id = form_leads.id
+                            LIMIT 1
+                        )
+                    ),
+                    assigned_booker_name = COALESCE(
+                        NULLIF(assigned_booker_name, ''),
+                        (
+                            SELECT booker_name
+                            FROM lead_assignments
+                            WHERE lead_assignments.lead_id = form_leads.id
+                            LIMIT 1
+                        )
+                    ),
+                    taken_at = COALESCE(
+                        taken_at,
+                        (
+                            SELECT assigned_at
+                            FROM lead_assignments
+                            WHERE lead_assignments.lead_id = form_leads.id
+                            LIMIT 1
+                        ),
+                        updated_at,
+                        created_at
+                    ),
+                    routing_status = 'assigned'
+                WHERE EXISTS (
+                    SELECT 1
+                    FROM lead_assignments
+                    WHERE lead_assignments.lead_id = form_leads.id
+                )
+            """)
+            connection.execute("""
+                UPDATE form_leads
                 SET routing_status = 'assigned'
                 WHERE (routing_status IS NULL OR routing_status = '')
                   AND EXISTS (
@@ -496,8 +574,9 @@ class Database:
     def list_responsible_history(self, *, days: int | None = None) -> list[dict[str, Any]]:
         where = """
             (
-                status = 'in_progress'
-                OR assigned_booker_telegram_id IS NOT NULL
+                assigned_booker_telegram_id IS NOT NULL
+                OR status = 'in_progress'
+                OR taken_at IS NOT NULL
             )
             AND COALESCE(
                 assigned_booker_telegram_id,
@@ -531,6 +610,31 @@ class Database:
                 params,
             ).fetchall()
         return [dict(row) for row in rows]
+
+    def get_leads_debug_counts(self) -> dict[str, int]:
+        with self.connect() as connection:
+            row = connection.execute(
+                """
+                SELECT
+                    COUNT(*) AS total_leads,
+                    SUM(CASE WHEN assigned_booker_telegram_id IS NOT NULL THEN 1 ELSE 0 END)
+                        AS assigned_booker_telegram_id,
+                    SUM(CASE WHEN status = 'in_progress' THEN 1 ELSE 0 END)
+                        AS in_progress,
+                    SUM(CASE WHEN taken_at IS NOT NULL THEN 1 ELSE 0 END)
+                        AS taken_at
+                FROM form_leads
+                """
+            ).fetchone()
+
+        return {
+            "total_leads": int(row["total_leads"] or 0),
+            "assigned_booker_telegram_id": int(row["assigned_booker_telegram_id"] or 0),
+            "in_progress": int(row["in_progress"] or 0),
+            "taken_at": int(row["taken_at"] or 0),
+            "history_all": len(self.list_responsible_history()),
+            "history_month": len(self.list_responsible_history(days=30)),
+        }
 
     def get_lead_assignment(self, lead_id: int) -> dict[str, Any] | None:
         with self.connect() as connection:
