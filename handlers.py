@@ -1,4 +1,5 @@
 import logging
+from datetime import datetime
 
 from aiogram import F, Router
 from aiogram.filters import Command, CommandObject, CommandStart
@@ -19,7 +20,7 @@ from notifications import NotificationService
 LOGGER = logging.getLogger(__name__)
 
 
-RESPONSIBILITY_BUTTON_TEXT = "📋 Посмотреть ответственность"
+RESPONSIBILITY_BUTTON_TEXT = "📋 Посмотреть ответственных"
 
 ADD_BRAND_RULE_HELP = (
     "Чтобы закрепить бренд за букером, отправьте команду:\n\n"
@@ -42,7 +43,23 @@ def _start_keyboard() -> ReplyKeyboardMarkup:
             [KeyboardButton(text=RESPONSIBILITY_BUTTON_TEXT)],
         ],
         resize_keyboard=True,
-        input_field_placeholder="Выберите действие",
+    )
+
+
+def _responsible_history_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="За последний месяц",
+                    callback_data="responsible_history:month",
+                ),
+                InlineKeyboardButton(
+                    text="За всё время",
+                    callback_data="responsible_history:all",
+                ),
+            ],
+        ]
     )
 
 
@@ -111,6 +128,92 @@ def _brand_rules_text(database: Database) -> str:
 
     lines = ["📋 Ответственность по брендам", ""]
     lines.extend(_booker_line(rule) for rule in rules)
+    return "\n".join(lines)
+
+
+def _history_booker_label(row: dict) -> str:
+    username = str(row.get("booker_username") or "").strip()
+    if username:
+        return username if username.startswith("@") else f"@{username}"
+
+    name = str(row.get("booker_name") or "").strip()
+    if name:
+        extracted_username = NotificationService._extract_username(name)
+        if extracted_username:
+            return extracted_username
+        return (
+            NotificationService._clean_booker_name(
+                name,
+                username=None,
+                booker_id=str(row.get("booker_telegram_id") or ""),
+            )
+            or name
+        )
+
+    return str(row.get("booker_telegram_id") or "unknown")
+
+
+def _format_history_date(value: str | None) -> str:
+    if not value:
+        return "дата не указана"
+
+    text = str(value).strip()
+    for candidate in (text, text.replace("Z", "+00:00")):
+        try:
+            return datetime.fromisoformat(candidate).strftime("%d.%m")
+        except ValueError:
+            pass
+
+    for pattern in ("%Y-%m-%d %H:%M:%S", "%d.%m.%Y %H:%M:%S", "%d.%m.%Y"):
+        try:
+            return datetime.strptime(text, pattern).strftime("%d.%m")
+        except ValueError:
+            pass
+
+    return text[:5] if len(text) >= 5 else text
+
+
+def _responsible_history_text(database: Database, period: str) -> str:
+    is_month = period == "month"
+    rows = database.list_responsible_history(days=30 if is_month else None)
+    if not rows:
+        return (
+            "За последний месяц пока нет ответственных по заявкам."
+            if is_month
+            else "Пока нет ответственных по заявкам."
+        )
+
+    grouped: dict[int, dict] = {}
+    for row in rows:
+        booker_id = int(row["booker_telegram_id"])
+        if booker_id not in grouped:
+            grouped[booker_id] = {
+                "label": _history_booker_label(row),
+                "leads": [],
+            }
+        grouped[booker_id]["leads"].append(row)
+
+    sorted_groups = sorted(
+        grouped.values(),
+        key=lambda group: (-len(group["leads"]), group["label"].lower()),
+    )
+
+    title = "📋 Ответственные за последний месяц" if is_month else "📋 Ответственные за всё время"
+    lines = [title, "", f"Всего заявок в работе: {len(rows)}"]
+
+    for group in sorted_groups:
+        leads = sorted(
+            group["leads"],
+            key=lambda row: str(row.get("taken_at") or ""),
+            reverse=True,
+        )
+        lines.extend(["", f"{group['label']} — {len(leads)}"])
+        for lead in leads[:20]:
+            brand_name = str(lead.get("brand_name") or "").strip() or "бренд не указан"
+            lines.append(f"• {_format_history_date(lead.get('taken_at'))} — {brand_name}")
+        if len(leads) > 20:
+            lines.append(f"...и ещё {len(leads) - 20}")
+
     return "\n".join(lines)
 
 
@@ -232,7 +335,9 @@ def build_router(database: Database, notification_service: NotificationService) 
                 common_notification_status=lead.get("common_notification_status"),
                 personal_notification_status=lead.get("personal_notification_status"),
                 assigned_booker_id=user.id,
-                assigned_booker_name=label,
+                assigned_booker_telegram_id=user.id,
+                assigned_booker_username=username,
+                assigned_booker_name=full_name,
                 last_error=None,
             )
 
@@ -252,7 +357,10 @@ def build_router(database: Database, notification_service: NotificationService) 
 
     @router.message(F.text == RESPONSIBILITY_BUTTON_TEXT)
     async def responsibility_button(message: Message) -> None:
-        await message.answer(_brand_rules_text(database))
+        await message.answer(
+            "Какой период показать?",
+            reply_markup=_responsible_history_keyboard(),
+        )
 
     @router.message(Command("brand_rules"))
     async def brand_rules(message: Message) -> None:
@@ -309,6 +417,15 @@ def build_router(database: Database, notification_service: NotificationService) 
     @router.callback_query(F.data == "show_test_brand_route_help")
     async def show_test_brand_route_help(callback: CallbackQuery) -> None:
         await _send_callback_message(callback, TEST_BRAND_ROUTE_HELP, parse_mode="HTML")
+
+    @router.callback_query(F.data.startswith("responsible_history:"))
+    async def responsible_history(callback: CallbackQuery) -> None:
+        period = callback.data.split(":", 1)[1] if callback.data else ""
+        if period not in {"month", "all"}:
+            await callback.answer("Некорректный период.", show_alert=True)
+            return
+
+        await _send_callback_message(callback, _responsible_history_text(database, period))
 
     @router.callback_query(F.data.startswith("take_lead:"))
     @router.callback_query(F.data.startswith("lead_take:"))

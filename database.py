@@ -59,7 +59,10 @@ class Database:
                     common_notification_status TEXT NOT NULL DEFAULT 'pending',
                     personal_notification_status TEXT NOT NULL DEFAULT 'not_needed',
                     assigned_booker_id INTEGER NULL,
+                    assigned_booker_telegram_id INTEGER NULL,
+                    assigned_booker_username TEXT NULL,
                     assigned_booker_name TEXT NULL,
+                    taken_at TEXT NULL,
                     last_error TEXT NULL,
                     created_at TEXT DEFAULT CURRENT_TIMESTAMP,
                     updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
@@ -93,7 +96,10 @@ class Database:
                     "common_notification_status": "common_notification_status TEXT NOT NULL DEFAULT 'pending'",
                     "personal_notification_status": "personal_notification_status TEXT NOT NULL DEFAULT 'not_needed'",
                     "assigned_booker_id": "assigned_booker_id INTEGER NULL",
+                    "assigned_booker_telegram_id": "assigned_booker_telegram_id INTEGER NULL",
+                    "assigned_booker_username": "assigned_booker_username TEXT NULL",
                     "assigned_booker_name": "assigned_booker_name TEXT NULL",
+                    "taken_at": "taken_at TEXT NULL",
                     "last_error": "last_error TEXT NULL",
                     "created_at": "created_at TEXT DEFAULT CURRENT_TIMESTAMP",
                     "updated_at": "updated_at TEXT DEFAULT CURRENT_TIMESTAMP",
@@ -218,9 +224,25 @@ class Database:
             """)
             connection.execute("""
                 UPDATE form_leads
+                SET assigned_booker_telegram_id = assigned_booker_id
+                WHERE assigned_booker_telegram_id IS NULL
+                  AND assigned_booker_id IS NOT NULL
+                  AND status = 'in_progress'
+            """)
+            connection.execute("""
+                UPDATE form_leads
                 SET assigned_booker_name = responsible_booker_name
                 WHERE (assigned_booker_name IS NULL OR assigned_booker_name = '')
                   AND responsible_booker_name IS NOT NULL
+            """)
+            connection.execute("""
+                UPDATE form_leads
+                SET taken_at = COALESCE(updated_at, created_at)
+                WHERE taken_at IS NULL
+                  AND (
+                      status = 'in_progress'
+                      OR assigned_booker_telegram_id IS NOT NULL
+                  )
             """)
             connection.execute("""
                 UPDATE form_leads
@@ -321,9 +343,15 @@ class Database:
         common_notification_status: str | None = None,
         personal_notification_status: str | None = None,
         assigned_booker_id: int | None = None,
+        assigned_booker_telegram_id: int | None = None,
+        assigned_booker_username: str | None = None,
         assigned_booker_name: str | None = None,
+        taken_at: str | None = None,
         last_error: str | None = None,
     ) -> None:
+        if assigned_booker_telegram_id is None:
+            assigned_booker_telegram_id = assigned_booker_id
+
         with self.connect() as connection:
             connection.execute(
                 """
@@ -336,7 +364,10 @@ class Database:
                     common_notification_status = COALESCE(?, common_notification_status),
                     personal_notification_status = COALESCE(?, personal_notification_status),
                     assigned_booker_id = COALESCE(?, assigned_booker_id),
+                    assigned_booker_telegram_id = COALESCE(?, assigned_booker_telegram_id),
+                    assigned_booker_username = COALESCE(?, assigned_booker_username),
                     assigned_booker_name = COALESCE(?, assigned_booker_name),
+                    taken_at = COALESCE(?, taken_at),
                     last_error = ?,
                     updated_at = CURRENT_TIMESTAMP
                 WHERE id = ?
@@ -350,7 +381,10 @@ class Database:
                     common_notification_status,
                     personal_notification_status,
                     assigned_booker_id,
+                    assigned_booker_telegram_id,
+                    assigned_booker_username,
                     assigned_booker_name,
+                    taken_at,
                     last_error,
                     lead_id,
                 ),
@@ -434,7 +468,10 @@ class Database:
                         responsible_booker_telegram_id = ?,
                         responsible_booker_name = ?,
                         assigned_booker_id = ?,
+                        assigned_booker_telegram_id = ?,
+                        assigned_booker_username = ?,
                         assigned_booker_name = ?,
+                        taken_at = COALESCE(taken_at, CURRENT_TIMESTAMP),
                         routing_status = 'assigned',
                         personal_notification_status = CASE
                             WHEN personal_message_id IS NULL THEN 'pending'
@@ -443,10 +480,57 @@ class Database:
                         updated_at = CURRENT_TIMESTAMP
                     WHERE id = ?
                     """,
-                    (booker_telegram_id, booker_name, booker_telegram_id, booker_name, lead_id),
+                    (
+                        booker_telegram_id,
+                        booker_name,
+                        booker_telegram_id,
+                        booker_telegram_id,
+                        booker_username,
+                        booker_name,
+                        lead_id,
+                    ),
                 )
 
             return assigned, self._to_dict(assignment)
+
+    def list_responsible_history(self, *, days: int | None = None) -> list[dict[str, Any]]:
+        where = """
+            (
+                status = 'in_progress'
+                OR assigned_booker_telegram_id IS NOT NULL
+            )
+            AND COALESCE(
+                assigned_booker_telegram_id,
+                assigned_booker_id,
+                responsible_booker_telegram_id
+            ) IS NOT NULL
+        """
+        params: tuple[Any, ...] = ()
+        if days is not None:
+            where += " AND datetime(COALESCE(taken_at, updated_at, created_at)) >= datetime('now', ?)"
+            params = (f"-{int(days)} days",)
+
+        with self.connect() as connection:
+            rows = connection.execute(
+                f"""
+                SELECT
+                    id,
+                    brand_name,
+                    COALESCE(taken_at, updated_at, created_at) AS taken_at,
+                    COALESCE(
+                        assigned_booker_telegram_id,
+                        assigned_booker_id,
+                        responsible_booker_telegram_id
+                    ) AS booker_telegram_id,
+                    assigned_booker_username AS booker_username,
+                    COALESCE(assigned_booker_name, responsible_booker_name) AS booker_name
+                FROM form_leads
+                WHERE {where}
+                ORDER BY datetime(COALESCE(taken_at, updated_at, created_at)) DESC, id DESC
+                """,
+                params,
+            ).fetchall()
+        return [dict(row) for row in rows]
 
     def get_lead_assignment(self, lead_id: int) -> dict[str, Any] | None:
         with self.connect() as connection:
