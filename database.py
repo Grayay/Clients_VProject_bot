@@ -43,6 +43,12 @@ class Database:
                     external_id TEXT NOT NULL,
                     brand_name TEXT,
                     submitted_at TEXT,
+                    client_name TEXT,
+                    shooting_location TEXT,
+                    shooting_city TEXT,
+                    contact TEXT,
+                    shooting_date_period TEXT,
+                    comment TEXT,
                     raw_payload TEXT NOT NULL,
                     status TEXT NOT NULL DEFAULT 'new',
                     responsible_booker_telegram_id INTEGER NULL,
@@ -50,6 +56,11 @@ class Database:
                     common_chat_message_id INTEGER NULL,
                     personal_message_id INTEGER NULL,
                     routing_status TEXT NULL,
+                    common_notification_status TEXT NOT NULL DEFAULT 'pending',
+                    personal_notification_status TEXT NOT NULL DEFAULT 'not_needed',
+                    assigned_booker_id INTEGER NULL,
+                    assigned_booker_name TEXT NULL,
+                    last_error TEXT NULL,
                     created_at TEXT DEFAULT CURRENT_TIMESTAMP,
                     updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
                     UNIQUE(source, sheet_id, sheet_tab, row_number)
@@ -66,6 +77,12 @@ class Database:
                     "external_id": "external_id TEXT NOT NULL DEFAULT ''",
                     "brand_name": "brand_name TEXT",
                     "submitted_at": "submitted_at TEXT",
+                    "client_name": "client_name TEXT",
+                    "shooting_location": "shooting_location TEXT",
+                    "shooting_city": "shooting_city TEXT",
+                    "contact": "contact TEXT",
+                    "shooting_date_period": "shooting_date_period TEXT",
+                    "comment": "comment TEXT",
                     "raw_payload": "raw_payload TEXT NOT NULL DEFAULT '{}'",
                     "status": "status TEXT NOT NULL DEFAULT 'new'",
                     "responsible_booker_telegram_id": "responsible_booker_telegram_id INTEGER NULL",
@@ -73,6 +90,11 @@ class Database:
                     "common_chat_message_id": "common_chat_message_id INTEGER NULL",
                     "personal_message_id": "personal_message_id INTEGER NULL",
                     "routing_status": "routing_status TEXT NULL",
+                    "common_notification_status": "common_notification_status TEXT NOT NULL DEFAULT 'pending'",
+                    "personal_notification_status": "personal_notification_status TEXT NOT NULL DEFAULT 'not_needed'",
+                    "assigned_booker_id": "assigned_booker_id INTEGER NULL",
+                    "assigned_booker_name": "assigned_booker_name TEXT NULL",
+                    "last_error": "last_error TEXT NULL",
                     "created_at": "created_at TEXT DEFAULT CURRENT_TIMESTAMP",
                     "updated_at": "updated_at TEXT DEFAULT CURRENT_TIMESTAMP",
                 },
@@ -129,8 +151,78 @@ class Database:
                 ON form_leads(status)
             """)
             connection.execute("""
+                CREATE INDEX IF NOT EXISTS idx_form_leads_common_notification_status
+                ON form_leads(common_notification_status)
+            """)
+            connection.execute("""
+                CREATE INDEX IF NOT EXISTS idx_form_leads_personal_notification_status
+                ON form_leads(personal_notification_status)
+            """)
+            connection.execute("""
                 CREATE UNIQUE INDEX IF NOT EXISTS idx_lead_assignments_lead_id
                 ON lead_assignments(lead_id)
+            """)
+            connection.execute("""
+                UPDATE form_leads
+                SET routing_status = 'assigned'
+                WHERE (routing_status IS NULL OR routing_status = '')
+                  AND EXISTS (
+                      SELECT 1
+                      FROM lead_assignments
+                      WHERE lead_assignments.lead_id = form_leads.id
+                  )
+            """)
+            connection.execute("""
+                UPDATE form_leads
+                SET routing_status = 'matched'
+                WHERE (routing_status IS NULL OR routing_status = '')
+                  AND responsible_booker_telegram_id IS NOT NULL
+            """)
+            connection.execute("""
+                UPDATE form_leads
+                SET routing_status = 'not_matched'
+                WHERE routing_status IS NULL OR routing_status = ''
+            """)
+            connection.execute("""
+                UPDATE form_leads
+                SET assigned_booker_id = responsible_booker_telegram_id
+                WHERE assigned_booker_id IS NULL
+                  AND responsible_booker_telegram_id IS NOT NULL
+            """)
+            connection.execute("""
+                UPDATE form_leads
+                SET assigned_booker_name = responsible_booker_name
+                WHERE (assigned_booker_name IS NULL OR assigned_booker_name = '')
+                  AND responsible_booker_name IS NOT NULL
+            """)
+            connection.execute("""
+                UPDATE form_leads
+                SET common_notification_status = 'sent'
+                WHERE common_chat_message_id IS NOT NULL
+                  AND COALESCE(common_notification_status, '') != 'sent'
+            """)
+            connection.execute("""
+                UPDATE form_leads
+                SET common_notification_status = 'pending'
+                WHERE common_notification_status IS NULL OR common_notification_status = ''
+            """)
+            connection.execute("""
+                UPDATE form_leads
+                SET personal_notification_status = 'sent'
+                WHERE personal_message_id IS NOT NULL
+                  AND COALESCE(personal_notification_status, '') != 'sent'
+            """)
+            connection.execute("""
+                UPDATE form_leads
+                SET personal_notification_status = 'pending'
+                WHERE COALESCE(personal_notification_status, 'not_needed') = 'not_needed'
+                  AND assigned_booker_id IS NOT NULL
+                  AND personal_message_id IS NULL
+            """)
+            connection.execute("""
+                UPDATE form_leads
+                SET personal_notification_status = 'not_needed'
+                WHERE personal_notification_status IS NULL OR personal_notification_status = ''
             """)
 
     @staticmethod
@@ -151,9 +243,15 @@ class Database:
                     external_id,
                     brand_name,
                     submitted_at,
+                    client_name,
+                    shooting_location,
+                    shooting_city,
+                    contact,
+                    shooting_date_period,
+                    comment,
                     raw_payload
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     lead.get("source", "google_sheets"),
@@ -163,6 +261,12 @@ class Database:
                     lead["external_id"],
                     lead.get("brand_name"),
                     lead.get("submitted_at"),
+                    lead.get("client_name"),
+                    lead.get("shooting_location"),
+                    lead.get("shooting_city"),
+                    lead.get("contact"),
+                    lead.get("shooting_date_period"),
+                    lead.get("comment"),
                     lead["raw_payload"],
                 ),
             )
@@ -187,16 +291,31 @@ class Database:
         common_chat_message_id: int | None,
         personal_message_id: int | None,
         routing_status: str,
+        common_notification_status: str | None = None,
+        personal_notification_status: str | None = None,
+        assigned_booker_id: int | None = None,
+        assigned_booker_name: str | None = None,
+        last_error: str | None = None,
     ) -> None:
+        if assigned_booker_id is None:
+            assigned_booker_id = responsible_booker_telegram_id
+        if assigned_booker_name is None:
+            assigned_booker_name = responsible_booker_name
+
         with self.connect() as connection:
             connection.execute(
                 """
                 UPDATE form_leads
                 SET responsible_booker_telegram_id = ?,
                     responsible_booker_name = ?,
-                    common_chat_message_id = ?,
-                    personal_message_id = ?,
+                    common_chat_message_id = COALESCE(?, common_chat_message_id),
+                    personal_message_id = COALESCE(?, personal_message_id),
                     routing_status = ?,
+                    common_notification_status = COALESCE(?, common_notification_status),
+                    personal_notification_status = COALESCE(?, personal_notification_status),
+                    assigned_booker_id = ?,
+                    assigned_booker_name = ?,
+                    last_error = ?,
                     updated_at = CURRENT_TIMESTAMP
                 WHERE id = ?
                 """,
@@ -206,9 +325,35 @@ class Database:
                     common_chat_message_id,
                     personal_message_id,
                     routing_status,
+                    common_notification_status,
+                    personal_notification_status,
+                    assigned_booker_id,
+                    assigned_booker_name,
+                    last_error,
                     lead_id,
                 ),
             )
+
+    def list_leads_needing_notification_retry(self, limit: int = 50) -> list[dict[str, Any]]:
+        with self.connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT *
+                FROM form_leads
+                WHERE (
+                    common_chat_message_id IS NULL
+                    AND COALESCE(common_notification_status, 'pending') IN ('pending', 'failed')
+                )
+                OR (
+                    personal_message_id IS NULL
+                    AND COALESCE(personal_notification_status, 'not_needed') IN ('pending', 'failed')
+                )
+                ORDER BY created_at ASC, id ASC
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+        return [dict(row) for row in rows]
 
     def assign_lead(
         self,
@@ -219,11 +364,29 @@ class Database:
     ) -> tuple[bool, dict[str, Any] | None]:
         with self.connect() as connection:
             lead = connection.execute(
-                "SELECT id FROM form_leads WHERE id = ?",
+                """
+                SELECT
+                    id,
+                    responsible_booker_telegram_id,
+                    responsible_booker_name,
+                    assigned_booker_id,
+                    assigned_booker_name
+                FROM form_leads
+                WHERE id = ?
+                """,
                 (lead_id,),
             ).fetchone()
             if lead is None:
                 return False, None
+
+            existing_booker_id = lead["assigned_booker_id"] or lead["responsible_booker_telegram_id"]
+            if existing_booker_id:
+                return False, {
+                    "lead_id": lead_id,
+                    "booker_telegram_id": existing_booker_id,
+                    "booker_username": None,
+                    "booker_name": lead["assigned_booker_name"] or lead["responsible_booker_name"],
+                }
 
             cursor = connection.execute(
                 """
@@ -256,10 +419,17 @@ class Database:
                     SET status = 'in_progress',
                         responsible_booker_telegram_id = ?,
                         responsible_booker_name = ?,
+                        assigned_booker_id = ?,
+                        assigned_booker_name = ?,
+                        routing_status = 'assigned',
+                        personal_notification_status = CASE
+                            WHEN personal_message_id IS NULL THEN 'pending'
+                            ELSE personal_notification_status
+                        END,
                         updated_at = CURRENT_TIMESTAMP
                     WHERE id = ?
                     """,
-                    (booker_telegram_id, booker_name, lead_id),
+                    (booker_telegram_id, booker_name, booker_telegram_id, booker_name, lead_id),
                 )
 
             return assigned, self._to_dict(assignment)

@@ -1,6 +1,7 @@
 import hashlib
 import json
 import logging
+import re
 from typing import Any
 
 from google.oauth2.service_account import Credentials
@@ -11,17 +12,61 @@ from config import Config
 
 LOGGER = logging.getLogger(__name__)
 
-TIMESTAMP_HEADERS = {
-    "timestamp",
-    "отметка времени",
-    "время заполнения",
-}
-
-BRAND_HEADERS = {
-    "название бренда",
-    "бренд",
-    "brand",
-    "brand name",
+FIELD_HEADER_ALIASES: dict[str, set[str]] = {
+    "submitted_at": {
+        "timestamp",
+        "отметка времени",
+        "время заполнения",
+    },
+    "client_name": {
+        "ваше имя",
+        "имя",
+        "имя клиента",
+        "client name",
+        "name",
+    },
+    "brand_name": {
+        "название бренда",
+        "бренд",
+        "brand",
+        "brand name",
+    },
+    "shooting_location": {
+        "место съемки",
+        "место съёмки",
+        "локация съемки",
+        "локация съёмки",
+        "location",
+    },
+    "shooting_city": {
+        "город, если выбран другой город",
+        "город если выбран другой город",
+        "город для съемки",
+        "город для съёмки",
+        "город",
+    },
+    "contact": {
+        "контакт для связи (телефон или ник в тг)",
+        "контакт для связи",
+        "телефон или ник в тг",
+        "контакт",
+        "contact",
+    },
+    "shooting_date_period": {
+        "дата/период съемки",
+        "дата/период съёмки",
+        "дата съемки",
+        "дата съёмки",
+        "период съемки",
+        "период съёмки",
+    },
+    "comment": {
+        "комментарий / описание задачи",
+        "комментарий/описание задачи",
+        "комментарий",
+        "описание задачи",
+        "comment",
+    },
 }
 
 
@@ -41,7 +86,10 @@ class GoogleSheetsClient:
 
     @staticmethod
     def _normalize_header(value: str) -> str:
-        return str(value or "").strip().lower().replace("ё", "е")
+        text = str(value or "").strip().lower().replace("ё", "е")
+        text = re.sub(r"\s+", " ", text)
+        text = re.sub(r"\s*/\s*", "/", text)
+        return text
 
     @staticmethod
     def _sheet_range(sheet_tab: str) -> str:
@@ -55,6 +103,13 @@ class GoogleSheetsClient:
             if GoogleSheetsClient._normalize_header(header) in normalized_candidates:
                 return index
         return None
+
+    @staticmethod
+    def _find_columns(headers: list[str]) -> dict[str, int | None]:
+        return {
+            field_name: GoogleSheetsClient._find_column(headers, aliases)
+            for field_name, aliases in FIELD_HEADER_ALIASES.items()
+        }
 
     @staticmethod
     def _cell(row: list[Any], index: int | None) -> str | None:
@@ -99,10 +154,7 @@ class GoogleSheetsClient:
             return []
 
         headers = [str(item) for item in values[0]]
-        timestamp_index = self._find_column(headers, TIMESTAMP_HEADERS)
-        brand_index = self._find_column(headers, BRAND_HEADERS)
-        if brand_index is None:
-            brand_index = 1 if len(headers) > 1 else 0
+        field_indexes = self._find_columns(headers)
 
         leads = []
         for row_number, row in enumerate(values[1:], start=2):
@@ -111,8 +163,10 @@ class GoogleSheetsClient:
 
             payload = self._raw_payload(headers, row)
             raw_payload = json.dumps(payload, ensure_ascii=False, sort_keys=True)
-            brand_name = self._cell(row, brand_index)
-            submitted_at = self._cell(row, timestamp_index)
+            field_values = {
+                field_name: self._cell(row, index)
+                for field_name, index in field_indexes.items()
+            }
 
             leads.append(
                 {
@@ -126,8 +180,14 @@ class GoogleSheetsClient:
                         row_number,
                         raw_payload,
                     ),
-                    "brand_name": brand_name,
-                    "submitted_at": submitted_at,
+                    "brand_name": field_values.get("brand_name"),
+                    "submitted_at": field_values.get("submitted_at"),
+                    "client_name": field_values.get("client_name"),
+                    "shooting_location": field_values.get("shooting_location"),
+                    "shooting_city": field_values.get("shooting_city"),
+                    "contact": field_values.get("contact"),
+                    "shooting_date_period": field_values.get("shooting_date_period"),
+                    "comment": field_values.get("comment"),
                     "raw_payload": raw_payload,
                 }
             )

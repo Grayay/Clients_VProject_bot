@@ -2,7 +2,7 @@ import logging
 
 from aiogram import F, Router
 from aiogram.filters import Command, CommandObject, CommandStart
-from aiogram.types import CallbackQuery, Message
+from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
 from brand_router import find_booker_for_brand, find_exact_brand_rule, normalize_brand
 from database import Database
@@ -10,6 +10,46 @@ from notifications import NotificationService
 
 
 LOGGER = logging.getLogger(__name__)
+
+
+ADD_BRAND_RULE_HELP = (
+    "Чтобы закрепить бренд за букером, отправьте команду:\n\n"
+    "<code>/add_brand_rule &lt;бренд&gt; &lt;telegram_id&gt; &lt;имя&gt;</code>\n\n"
+    "Пример:\n"
+    "<code>/add_brand_rule Lime 123456789 Анна</code>"
+)
+
+TEST_BRAND_ROUTE_HELP = (
+    "Чтобы проверить, к кому относится бренд, отправьте:\n\n"
+    "<code>/test_brand_route &lt;бренд&gt;</code>\n\n"
+    "Пример:\n"
+    "<code>/test_brand_route Lime</code>"
+)
+
+
+def _start_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="📋 Закрепления брендов",
+                    callback_data="show_brand_rules",
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    text="➕ Как добавить бренд",
+                    callback_data="show_add_brand_rule_help",
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    text="🔍 Как проверить бренд",
+                    callback_data="show_test_brand_route_help",
+                ),
+            ],
+        ]
+    )
 
 
 def _user_label(message_or_callback: Message | CallbackQuery) -> str:
@@ -22,12 +62,13 @@ def _user_label(message_or_callback: Message | CallbackQuery) -> str:
 
 
 def _booker_display(user_id: int, username: str | None, full_name: str | None) -> str:
-    parts = []
-    if username:
-        parts.append(f"@{username}")
     if full_name:
-        parts.append(full_name)
-    return " / ".join(parts) or str(user_id)
+        if username:
+            return f"{full_name} (@{username})"
+        return f"{full_name} ({user_id})"
+    if username:
+        return f"@{username}"
+    return str(user_id)
 
 
 def _assignment_label(assignment: dict | None) -> str | None:
@@ -41,11 +82,36 @@ def _assignment_label(assignment: dict | None) -> str | None:
 
 
 def _booker_line(rule: dict) -> str:
-    name = str(rule.get("booker_name") or "").strip()
-    booker_id = rule["booker_telegram_id"]
-    if name:
-        return f"{rule['brand_pattern']} → {name} / {booker_id}"
-    return f"{rule['brand_pattern']} → {booker_id}"
+    return f"• {_brand_rule_display(rule)}"
+
+
+def _brand_rule_display(rule: dict) -> str:
+    booker = NotificationService.format_booker_label(
+        rule["booker_telegram_id"],
+        rule.get("booker_name"),
+    )
+    return f"{rule['brand_pattern']} → {booker}"
+
+
+def _brand_rules_text(database: Database) -> str:
+    rules = database.list_active_brand_rules()
+    if not rules:
+        return "Пока нет активных закреплений брендов."
+
+    lines = ["📋 Закрепления брендов", ""]
+    lines.extend(_booker_line(rule) for rule in rules)
+    return "\n".join(lines)
+
+
+async def _send_callback_message(
+    callback: CallbackQuery,
+    text: str,
+    *,
+    parse_mode: str | None = None,
+) -> None:
+    await callback.answer()
+    if callback.message:
+        await callback.message.answer(text, parse_mode=parse_mode)
 
 
 def _parse_lead_id(data: str | None) -> int | None:
@@ -90,23 +156,17 @@ def build_router(database: Database, notification_service: NotificationService) 
     @router.message(CommandStart())
     async def start(message: Message) -> None:
         await message.answer(
-            "Бот заявок из Google Forms.\n\n"
-            "Команды:\n"
-            "/brand_rules - список активных правил\n"
-            "/add_brand_rule <бренд> <telegram_id> <имя опционально>\n"
-            "/test_brand_route <бренд>"
+            "Бот заявок клиентов\n\n"
+            "Что можно сделать:\n"
+            "• посмотреть закрепления брендов;\n"
+            "• добавить бренд к букеру;\n"
+            "• проверить, к кому относится бренд.",
+            reply_markup=_start_keyboard(),
         )
 
     @router.message(Command("brand_rules"))
     async def brand_rules(message: Message) -> None:
-        rules = database.list_active_brand_rules()
-        if not rules:
-            await message.answer("Активных правил маршрутизации брендов пока нет.")
-            return
-
-        lines = ["Активные правила маршрутизации:"]
-        lines.extend(_booker_line(rule) for rule in rules)
-        await message.answer("\n".join(lines))
+        await message.answer(_brand_rules_text(database))
 
     @router.message(Command("add_brand_rule"))
     async def add_brand_rule(message: Message, command: CommandObject) -> None:
@@ -146,7 +206,19 @@ def build_router(database: Database, notification_service: NotificationService) 
             await message.answer("not matched")
             return
 
-        await message.answer(f"matched: {_booker_line(booker)}")
+        await message.answer(f"matched: {_brand_rule_display(booker)}")
+
+    @router.callback_query(F.data == "show_brand_rules")
+    async def show_brand_rules(callback: CallbackQuery) -> None:
+        await _send_callback_message(callback, _brand_rules_text(database))
+
+    @router.callback_query(F.data == "show_add_brand_rule_help")
+    async def show_add_brand_rule_help(callback: CallbackQuery) -> None:
+        await _send_callback_message(callback, ADD_BRAND_RULE_HELP, parse_mode="HTML")
+
+    @router.callback_query(F.data == "show_test_brand_route_help")
+    async def show_test_brand_route_help(callback: CallbackQuery) -> None:
+        await _send_callback_message(callback, TEST_BRAND_ROUTE_HELP, parse_mode="HTML")
 
     @router.callback_query(F.data.startswith("take_lead:"))
     @router.callback_query(F.data.startswith("lead_take:"))
@@ -169,7 +241,12 @@ def build_router(database: Database, notification_service: NotificationService) 
 
         if not assigned:
             assigned_to = _assignment_label(assignment)
-            answer = "Заявку уже взял другой букер"
+            existing_booker_id = int(assignment["booker_telegram_id"])
+            answer = (
+                "Заявка уже закреплена за вами"
+                if existing_booker_id == user.id
+                else "Заявка уже закреплена за букером"
+            )
             if assigned_to:
                 answer = f"{answer}: {assigned_to}"
             await callback.answer(answer, show_alert=True)
@@ -187,7 +264,12 @@ def build_router(database: Database, notification_service: NotificationService) 
                 responsible_booker_name=label,
                 common_chat_message_id=lead.get("common_chat_message_id"),
                 personal_message_id=personal_message_id,
-                routing_status="assigned" if personal_message_id is not None else "assigned_personal_send_failed",
+                routing_status="assigned",
+                common_notification_status=lead.get("common_notification_status"),
+                personal_notification_status="sent" if personal_message_id is not None else "failed",
+                assigned_booker_id=user.id,
+                assigned_booker_name=label,
+                last_error=None if personal_message_id is not None else "personal notification failed after assignment",
             )
 
         await callback.answer("Заявка взята в работу.")
