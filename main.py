@@ -3,6 +3,7 @@ import logging
 
 from aiogram import Bot, Dispatcher
 
+from brand_router import deactivate_duplicate_active_brand_rules
 from config import load_config
 from database import Database
 from google_sheets_client import GoogleSheetsClient
@@ -35,6 +36,9 @@ async def main() -> None:
     config = load_config()
     database = Database(config.database_path)
     database.init()
+    deactivated_rules = deactivate_duplicate_active_brand_rules(database)
+    if deactivated_rules:
+        LOGGER.info("Deactivated duplicate active brand rules: %s", deactivated_rules)
 
     bot = Bot(token=config.bot_token)
     dispatcher = Dispatcher()

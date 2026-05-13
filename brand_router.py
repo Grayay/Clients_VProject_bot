@@ -21,11 +21,13 @@ def find_exact_brand_rule(brand_name: str, rules: list[dict[str, Any]]) -> dict[
     if not normalized_brand:
         return None
 
-    for rule in rules:
-        if rule.get("is_active") and normalize_brand(rule.get("brand_pattern")) == normalized_brand:
-            return rule
-
-    return None
+    return _current_rule(
+        [
+            rule
+            for rule in rules
+            if rule.get("is_active") and normalize_brand(rule.get("brand_pattern")) == normalized_brand
+        ]
+    )
 
 
 def find_exact_brand_rules(brand_name: str, rules: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -40,16 +42,51 @@ def find_exact_brand_rules(brand_name: str, rules: list[dict[str, Any]]) -> list
     ]
 
 
-def _dedupe_rules_by_booker(rules: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    result = []
-    seen_booker_ids = set()
+def _rule_sort_key(rule: dict[str, Any]) -> tuple[str, str, int]:
+    return (
+        str(rule.get("updated_at") or ""),
+        str(rule.get("created_at") or ""),
+        int(rule.get("id") or 0),
+    )
+
+
+def _current_rule(rules: list[dict[str, Any]]) -> dict[str, Any] | None:
+    return max(rules, key=_rule_sort_key) if rules else None
+
+
+def _single_current_rule(rules: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    rule = _current_rule(rules)
+    return [rule] if rule else []
+
+
+def current_active_brand_rules(rules: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    current_by_brand: dict[str, dict[str, Any]] = {}
     for rule in rules:
-        booker_id = rule.get("booker_telegram_id")
-        if booker_id in seen_booker_ids:
+        if not rule.get("is_active"):
             continue
-        seen_booker_ids.add(booker_id)
-        result.append(rule)
-    return result
+        normalized_brand = normalize_brand(rule.get("brand_pattern"))
+        if not normalized_brand:
+            continue
+
+        current = current_by_brand.get(normalized_brand)
+        if current is None or _rule_sort_key(rule) > _rule_sort_key(current):
+            current_by_brand[normalized_brand] = rule
+
+    return sorted(
+        current_by_brand.values(),
+        key=lambda rule: (normalize_brand(rule.get("brand_pattern")), int(rule.get("id") or 0)),
+    )
+
+
+def deactivate_duplicate_active_brand_rules(database: Database) -> int:
+    rules = database.list_active_brand_rules()
+    keep_rule_ids = {int(rule["id"]) for rule in current_active_brand_rules(rules)}
+    deactivate_rule_ids = [
+        int(rule["id"])
+        for rule in rules
+        if normalize_brand(rule.get("brand_pattern")) and int(rule["id"]) not in keep_rule_ids
+    ]
+    return database.deactivate_brand_rules(deactivate_rule_ids)
 
 
 def _find_bookers_in_rules(brand_name: str, rules: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -70,14 +107,14 @@ def _find_bookers_in_rules(brand_name: str, rules: list[dict[str, Any]]) -> list
         if normalized_brand == pattern
     ]
     if exact_matches:
-        return _dedupe_rules_by_booker(exact_matches)
+        return _single_current_rule(exact_matches)
 
     partial_matches = [
         rule
         for rule, pattern in normalized_rules
         if normalized_brand in pattern or pattern in normalized_brand
     ]
-    return _dedupe_rules_by_booker(partial_matches)
+    return _single_current_rule(partial_matches)
 
 
 def _find_booker_in_rules(brand_name: str, rules: list[dict[str, Any]]) -> dict[str, Any] | None:

@@ -549,7 +549,7 @@ class Database:
                         assigned_booker_telegram_id = ?,
                         assigned_booker_username = ?,
                         assigned_booker_name = ?,
-                        taken_at = COALESCE(taken_at, CURRENT_TIMESTAMP),
+                        taken_at = CURRENT_TIMESTAMP,
                         routing_status = 'assigned',
                         personal_notification_status = CASE
                             WHEN personal_message_id IS NULL THEN 'pending'
@@ -671,7 +671,20 @@ class Database:
         booker_telegram_id: int,
         booker_name: str | None = None,
     ) -> int:
-        return self.ensure_brand_rule(brand_pattern, booker_telegram_id, booker_name)
+        rule_id = self.ensure_brand_rule(brand_pattern, booker_telegram_id, booker_name)
+        with self.connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT id
+                FROM brand_booker_rules
+                WHERE is_active = 1
+                  AND lower(trim(brand_pattern)) = lower(trim(?))
+                  AND id != ?
+                """,
+                (brand_pattern.strip(), rule_id),
+            ).fetchall()
+        self.deactivate_brand_rules([int(row["id"]) for row in rows])
+        return rule_id
 
     def find_brand_rule_for_booker(
         self,
@@ -689,7 +702,7 @@ class Database:
         params: tuple[Any, ...] = (brand_pattern.strip(), booker_telegram_id)
         if only_active:
             sql += " AND is_active = 1"
-        sql += " ORDER BY is_active DESC, id ASC LIMIT 1"
+        sql += " ORDER BY is_active DESC, datetime(updated_at) DESC, id DESC LIMIT 1"
 
         with self.connect() as connection:
             row = connection.execute(sql, params).fetchone()
@@ -708,6 +721,12 @@ class Database:
             only_active=True,
         )
         if existing_active:
+            self.update_brand_rule(
+                int(existing_active["id"]),
+                brand_pattern,
+                booker_telegram_id,
+                booker_name,
+            )
             return int(existing_active["id"])
 
         existing_any = self.find_brand_rule_for_booker(
@@ -737,6 +756,25 @@ class Database:
                 (brand_pattern, booker_telegram_id, booker_name),
             )
             return int(cursor.lastrowid)
+
+    def deactivate_brand_rules(self, rule_ids: list[int] | set[int]) -> int:
+        ids = sorted({int(rule_id) for rule_id in rule_ids if rule_id is not None})
+        if not ids:
+            return 0
+
+        placeholders = ", ".join("?" for _ in ids)
+        with self.connect() as connection:
+            cursor = connection.execute(
+                f"""
+                UPDATE brand_booker_rules
+                SET is_active = 0,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE is_active = 1
+                  AND id IN ({placeholders})
+                """,
+                ids,
+            )
+            return cursor.rowcount
 
     def get_lead_personal_notification(
         self,

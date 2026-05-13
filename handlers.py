@@ -12,7 +12,13 @@ from aiogram.types import (
     ReplyKeyboardMarkup,
 )
 
-from brand_router import find_booker_for_brand, find_bookers_in_rules, normalize_brand
+from brand_router import (
+    current_active_brand_rules,
+    find_booker_for_brand,
+    find_bookers_in_rules,
+    find_exact_brand_rules,
+    normalize_brand,
+)
 from database import Database
 from notifications import NotificationService
 
@@ -68,11 +74,11 @@ def _take_confirmation_keyboard(lead_id: int, user_id: int) -> InlineKeyboardMar
         inline_keyboard=[
             [
                 InlineKeyboardButton(
-                    text="Всё равно взять",
+                    text="Да, взять",
                     callback_data=f"lead_take_force:{lead_id}:{user_id}",
                 ),
                 InlineKeyboardButton(
-                    text="Не брать",
+                    text="Нет",
                     callback_data=f"lead_take_cancel:{lead_id}:{user_id}",
                 ),
             ],
@@ -122,7 +128,7 @@ def _brand_rule_display(rule: dict) -> str:
 
 
 def _brand_rules_text(database: Database) -> str:
-    rules = database.list_active_brand_rules()
+    rules = current_active_brand_rules(database.list_active_brand_rules())
     if not rules:
         return "Пока нет ответственных брендов."
 
@@ -260,45 +266,51 @@ def _parse_lead_user_ids(data: str | None) -> tuple[int, int] | None:
         return None
 
 
-def _brand_responsibility_rules(database: Database, brand_name: str | None) -> list[dict]:
+def _brand_responsibility_rule(database: Database, brand_name: str | None) -> dict | None:
     normalized_brand = normalize_brand(brand_name)
     if not normalized_brand:
-        return []
-    return find_bookers_in_rules(normalized_brand, database.list_active_brand_rules())
+        return None
+
+    rules = find_bookers_in_rules(normalized_brand, database.list_active_brand_rules())
+    return rules[0] if rules else None
 
 
-def _user_is_responsible_for_brand(rules: list[dict], user_id: int) -> bool:
-    return any(int(rule["booker_telegram_id"]) == user_id for rule in rules)
-
-
-def _responsibility_labels(rules: list[dict]) -> list[str]:
-    return [
-        NotificationService.format_booker_label(
-            rule["booker_telegram_id"],
-            rule.get("booker_name"),
-        )
-        for rule in rules
-    ]
+def _responsibility_label(rule: dict) -> str:
+    return NotificationService.format_booker_label(
+        rule["booker_telegram_id"],
+        rule.get("booker_name"),
+    )
 
 
 def _save_brand_assignment(
     database: Database,
     brand_name: str | None,
     booker_telegram_id: int,
-    booker_label: str,
+    booker_label: str | None,
+    deactivate_rule_ids: list[int] | None = None,
 ) -> int | None:
     normalized_brand = normalize_brand(brand_name)
     if not normalized_brand:
         return None
 
+    active_rules = find_exact_brand_rules(normalized_brand, database.list_active_brand_rules())
     rule_id = database.ensure_brand_rule(normalized_brand, booker_telegram_id, booker_label)
+    old_rule_ids = {int(old_rule_id) for old_rule_id in deactivate_rule_ids or []}
+    old_rule_ids.update(
+        int(rule["id"])
+        for rule in active_rules
+        if int(rule["id"]) != int(rule_id)
+    )
+    old_rule_ids.discard(int(rule_id))
+    deactivated_count = database.deactivate_brand_rules(old_rule_ids)
 
     LOGGER.info(
-        "Brand assigned to booker: brand=%r normalized_brand=%r booker_id=%s rule_id=%s",
+        "Brand assigned to booker: brand=%r normalized_brand=%r booker_id=%s rule_id=%s deactivated_rules=%s",
         brand_name,
         normalized_brand,
         booker_telegram_id,
         rule_id,
+        deactivated_count,
     )
     return rule_id
 
@@ -306,7 +318,13 @@ def _save_brand_assignment(
 def build_router(database: Database, notification_service: NotificationService) -> Router:
     router = Router()
 
-    async def assign_lead_to_user(callback: CallbackQuery, lead_id: int) -> tuple[bool, str | None]:
+    async def assign_lead_to_user(
+        callback: CallbackQuery,
+        lead_id: int,
+        *,
+        handoff: bool = False,
+        deactivate_rule_ids: list[int] | None = None,
+    ) -> tuple[bool, str | None]:
         user = callback.from_user
         username = user.username
         full_name = user.full_name
@@ -335,7 +353,13 @@ def build_router(database: Database, notification_service: NotificationService) 
 
         lead = database.get_lead(lead_id)
         if lead is not None:
-            _save_brand_assignment(database, lead.get("brand_name"), user.id, label)
+            _save_brand_assignment(
+                database,
+                lead.get("brand_name"),
+                user.id,
+                label,
+                deactivate_rule_ids=deactivate_rule_ids,
+            )
             database.update_lead_routing(
                 lead_id,
                 responsible_booker_telegram_id=user.id,
@@ -356,6 +380,7 @@ def build_router(database: Database, notification_service: NotificationService) 
         await notification_service.announce_lead_assignment(
             lead or {"id": lead_id, "common_chat_message_id": None},
             NotificationService.format_booker_label(user.id, label),
+            is_handoff=handoff,
         )
         return True, label
 
@@ -418,7 +443,7 @@ def build_router(database: Database, notification_service: NotificationService) 
             return
 
         booker_name = parts[2].strip() if len(parts) > 2 and parts[2].strip() else None
-        rule_id = database.add_brand_rule(normalized_brand, booker_telegram_id, booker_name)
+        rule_id = _save_brand_assignment(database, normalized_brand, booker_telegram_id, booker_name)
         await message.answer(f"Правило добавлено: id={rule_id}")
 
     @router.message(Command("test_brand_route"))
@@ -479,14 +504,13 @@ def build_router(database: Database, notification_service: NotificationService) 
             await callback.answer(answer, show_alert=True)
             return
 
-        responsibility_rules = _brand_responsibility_rules(database, lead.get("brand_name"))
-        if responsibility_rules and not _user_is_responsible_for_brand(responsibility_rules, user.id):
-            labels = "\n".join(_responsibility_labels(responsibility_rules))
+        responsibility_rule = _brand_responsibility_rule(database, lead.get("brand_name"))
+        if responsibility_rule and int(responsibility_rule["booker_telegram_id"]) != user.id:
+            current_booker = _responsibility_label(responsibility_rule)
             await callback.answer()
             if callback.message:
                 await callback.message.answer(
-                    "Этот бренд уже закреплён за:\n"
-                    f"{labels}\n\n"
+                    f"Этот бренд уже закреплён за {current_booker}.\n\n"
                     "Всё равно взять в работу?",
                     reply_markup=_take_confirmation_keyboard(lead_id, user.id),
                 )
@@ -506,10 +530,21 @@ def build_router(database: Database, notification_service: NotificationService) 
             await callback.answer("Это подтверждение не для вас.", show_alert=True)
             return
 
-        assigned, label = await assign_lead_to_user(callback, lead_id)
+        lead = database.get_lead(lead_id)
+        responsibility_rule = _brand_responsibility_rule(database, lead.get("brand_name")) if lead else None
+        deactivate_rule_ids = []
+        if responsibility_rule and int(responsibility_rule["booker_telegram_id"]) != expected_user_id:
+            deactivate_rule_ids.append(int(responsibility_rule["id"]))
+
+        assigned, label = await assign_lead_to_user(
+            callback,
+            lead_id,
+            handoff=True,
+            deactivate_rule_ids=deactivate_rule_ids,
+        )
         if assigned and callback.message:
             await callback.message.edit_text(
-                f"Заявка взята в работу: {NotificationService.format_booker_label(expected_user_id, label)}"
+                f"Заявка перевзята в работу: {NotificationService.format_booker_label(expected_user_id, label)}"
             )
 
     @router.callback_query(F.data.startswith("lead_take_cancel:"))
@@ -524,7 +559,7 @@ def build_router(database: Database, notification_service: NotificationService) 
             await callback.answer("Это подтверждение не для вас.", show_alert=True)
             return
 
-        await callback.answer("Ок, не берём заявку.")
+        await callback.answer("Ок, заявка не взята.")
         if callback.message:
             await callback.message.edit_text("Заявка не взята.")
 

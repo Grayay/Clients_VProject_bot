@@ -102,7 +102,7 @@ class NotificationService:
     def _booker_label(bookers: dict[str, Any] | list[dict[str, Any]] | None) -> str:
         booker_list = NotificationService._as_booker_list(bookers)
         if not booker_list:
-            return "не найден"
+            return "не назначен"
 
         return ", ".join(
             NotificationService.format_booker_label(
@@ -183,12 +183,11 @@ class NotificationService:
         bookers: dict[str, Any] | list[dict[str, Any]] | None,
     ) -> str:
         lines = [
-            "🆕 Новая заявка от клиента",
+            "🆕 Новая заявка",
             "",
             f"Бренд: {self._value(lead.get('brand_name'))}",
-            f"Ответственный букер: {self._booker_label(bookers)}",
+            f"Ответственный: {self._booker_label(bookers)}",
             "",
-            "Данные заявки:",
             *self._payload_lines(lead),
         ]
         return self._truncate("\n".join(lines))
@@ -201,7 +200,6 @@ class NotificationService:
                     "",
                     f"Бренд: {self._value(lead.get('brand_name'))}",
                     "",
-                    "Данные заявки:",
                     *self._payload_lines(lead),
                 ]
             )
@@ -255,13 +253,20 @@ class NotificationService:
         )
         return message_id
 
-    async def announce_lead_assignment(self, lead: dict[str, Any], booker_label: str) -> None:
+    async def announce_lead_assignment(
+        self,
+        lead: dict[str, Any],
+        booker_label: str,
+        *,
+        is_handoff: bool = False,
+    ) -> None:
         lead_id = int(lead["id"])
         common_message_id = lead.get("common_chat_message_id")
+        action = "перевзял" if is_handoff else "взял"
         try:
             await self.bot.send_message(
                 chat_id=self.config.leads_notify_chat_id,
-                text=f"В работе: {booker_label}",
+                text=f"✅ Заявку {action} в работу: {booker_label}",
                 reply_to_message_id=int(common_message_id) if common_message_id else None,
                 allow_sending_without_reply=True,
             )
